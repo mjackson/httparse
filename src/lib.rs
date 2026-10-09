@@ -97,6 +97,15 @@ pub(crate) fn is_header_value_token(b: u8) -> bool {
     HEADER_VALUE_MAP[b as usize]
 }
 
+// Control characters a header value may also contain: all but NUL, CR and
+// LF. Fetch allows them, and browsers send and receive them. They're kept
+// out of `HEADER_VALUE_MAP`, so the vectorized scans stop at them and the
+// scalar loop takes them one at a time.
+#[inline]
+pub(crate) fn is_header_value_control(b: u8) -> bool {
+    matches!(b, 0x01..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f)
+}
+
 /// An error in parsing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Error {
@@ -1176,7 +1185,7 @@ fn parse_headers_iter_uninit<'a>(
                     bytes.slice();
                     continue 'whitespace_after_colon;
                 }
-                if is_header_value_token(b) {
+                if is_header_value_token(b) || is_header_value_control(b) {
                     break 'whitespace_after_colon;
                 }
 
@@ -1200,6 +1209,10 @@ fn parse_headers_iter_uninit<'a>(
 
                 simd::match_header_value_vectored(bytes);
                 let b = next!(bytes);
+
+                if is_header_value_control(b) {
+                    continue 'value_lines;
+                }
 
                 //found_ctl
                 let skip = if b == b'\r' {
@@ -2588,54 +2601,38 @@ mod tests {
     }
 
     #[test]
-    fn test_header_with_invalid_char_in_value() {
-        const RESPONSE: &[u8] =
-            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials: hell\x01o\r\nBread: baguette\r\n\r\n";
+    fn test_header_with_control_chars_in_value() {
+        let long = [b'a'; 40];
+        for b in (0x01..0x20).chain([0x7f]) {
+            if b == b'\t' || b == b'\r' || b == b'\n' {
+                continue;
+            }
+            let values: [Vec<u8>; 4] = [
+                vec![b],
+                vec![b, b'x'],
+                vec![b'x', b],
+                [&long[..], &[b], &long[..]].concat(),
+            ];
+            for value in &values {
+                let response = [&b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials: "[..], value, b"\r\nBread: baguette\r\n\r\n"].concat();
+                let mut headers = [EMPTY_HEADER; 2];
+                let mut parsed = Response::new(&mut headers[..]);
+                assert_eq!(parsed.parse(&response), Ok(Status::Complete(response.len())));
+                assert_eq!(parsed.headers[0].value, &value[..]);
+                assert_eq!(parsed.headers[1].value, &b"baguette"[..]);
 
-        let mut headers = [EMPTY_HEADER; 2];
-        let mut response = Response::new(&mut headers[..]);
-
-        let result = crate::ParserConfig::default()
-            .parse_response(&mut response, RESPONSE);
-        assert_eq!(result, Err(crate::Error::HeaderValue));
-
-        let result = crate::ParserConfig::default()
-            .ignore_invalid_headers_in_responses(true)
-            .parse_response(&mut response, RESPONSE);
-        assert_eq!(result, Ok(Status::Complete(78)));
-
-        assert_eq!(response.version.unwrap(), 1);
-        assert_eq!(response.code.unwrap(), 200);
-        assert_eq!(response.reason.unwrap(), "OK");
-        assert_eq!(response.headers.len(), 1);
-        assert_eq!(response.headers[0].name, "Bread");
-        assert_eq!(response.headers[0].value, &b"baguette"[..]);
-
-        const REQUEST: &[u8] =
-            b"GET / HTTP/1.1\r\nAccess-Control-Allow-Credentials: hell\x01o\r\nBread: baguette\r\n\r\n";
-
-        let mut headers = [EMPTY_HEADER; 2];
-        let mut request = Request::new(&mut headers[..]);
-
-        let result = crate::ParserConfig::default()
-            .parse_request(&mut request, REQUEST);
-        assert_eq!(result, Err(crate::Error::HeaderValue));
-
-        let result = crate::ParserConfig::default()
-            .ignore_invalid_headers_in_requests(true)
-            .parse_request(&mut request, REQUEST);
-        assert_eq!(result, Ok(Status::Complete(77)));
-
-        assert_eq!(request.version.unwrap(), 1);
-        assert_eq!(request.method.unwrap(), "GET");
-        assert_eq!(request.path.unwrap(), "/");
-        assert_eq!(request.headers.len(), 1);
-        assert_eq!(request.headers[0].name, "Bread");
-        assert_eq!(request.headers[0].value, &b"baguette"[..]);
+                let request = [&b"GET / HTTP/1.1\r\nAccess-Control-Allow-Credentials: "[..], value, b"\r\nBread: baguette\r\n\r\n"].concat();
+                let mut headers = [EMPTY_HEADER; 2];
+                let mut parsed = Request::new(&mut headers[..]);
+                assert_eq!(parsed.parse(&request), Ok(Status::Complete(request.len())));
+                assert_eq!(parsed.headers[0].value, &value[..]);
+                assert_eq!(parsed.headers[1].value, &b"baguette"[..]);
+            }
+        }
     }
 
     #[test]
-    fn test_header_with_invalid_char_in_value_with_folding() {
+    fn test_header_with_control_char_in_value_with_folding() {
         const RESPONSE: &[u8] =
             b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials: hell\x01o  \n world!\r\nBread: baguette\r\n\r\n";
 
@@ -2643,42 +2640,13 @@ mod tests {
         let mut response = Response::new(&mut headers[..]);
 
         let result = crate::ParserConfig::default()
+            .allow_obsolete_multiline_headers_in_responses(true)
             .parse_response(&mut response, RESPONSE);
-        assert_eq!(result, Err(crate::Error::HeaderValue));
+        assert_eq!(result, Ok(Status::Complete(RESPONSE.len())));
 
-        let result = crate::ParserConfig::default()
-            .ignore_invalid_headers_in_responses(true)
-            .parse_response(&mut response, RESPONSE);
-        assert_eq!(result, Ok(Status::Complete(88)));
-
-        assert_eq!(response.version.unwrap(), 1);
-        assert_eq!(response.code.unwrap(), 200);
-        assert_eq!(response.reason.unwrap(), "OK");
-        assert_eq!(response.headers.len(), 1);
-        assert_eq!(response.headers[0].name, "Bread");
-        assert_eq!(response.headers[0].value, &b"baguette"[..]);
-
-        const REQUEST: &[u8] =
-            b"GET / HTTP/1.1\r\nAccess-Control-Allow-Credentials: hell\x01o  \n world!\r\nBread: baguette\r\n\r\n";
-
-        let mut headers = [EMPTY_HEADER; 2];
-        let mut request = Request::new(&mut headers[..]);
-
-        let result = crate::ParserConfig::default()
-            .parse_request(&mut request, REQUEST);
-        assert_eq!(result, Err(crate::Error::HeaderValue));
-
-        let result = crate::ParserConfig::default()
-            .ignore_invalid_headers_in_requests(true)
-            .parse_request(&mut request, REQUEST);
-        assert_eq!(result, Ok(Status::Complete(87)));
-
-        assert_eq!(request.version.unwrap(), 1);
-        assert_eq!(request.method.unwrap(), "GET");
-        assert_eq!(request.path.unwrap(), "/");
-        assert_eq!(request.headers.len(), 1);
-        assert_eq!(request.headers[0].name, "Bread");
-        assert_eq!(request.headers[0].value, &b"baguette"[..]);
+        assert_eq!(response.headers.len(), 2);
+        assert_eq!(response.headers[0].value, &b"hell\x01o  \n world!"[..]);
+        assert_eq!(response.headers[1].value, &b"baguette"[..]);
     }
 
     #[test]
